@@ -1,0 +1,88 @@
+{
+  "info": {
+    "name": "POS Printer Service",
+    "description": "Collection for testing POS Printer Service",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:7777/health",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "7777",
+          "path": ["health"]
+        }
+      }
+    },
+    {
+      "name": "Print Receipt (JSON)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Print-Key",
+            "value": "dev-key-12345"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"data\": \"=== RECEIPT ===\\nItem 1: $10.00\\nItem 2: $5.00\\nTotal: $15.00\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "http://localhost:7777/print",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "7777",
+          "path": ["print"]
+        }
+      }
+    },
+    {
+      "name": "Print Receipt (Plain Text)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "text/plain"
+          },
+          {
+            "key": "X-Print-Key",
+            "value": "dev-key-12345"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "=== RECEIPT ===\nItem 1: $10.00\nItem 2: $5.00\nTotal: $15.00",
+          "options": {
+            "raw": {
+              "language": "plaintext"
+            }
+          }
+        },
+        "url": {
+          "raw": "http://localhost:7777/print",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "7777",
+          "path": ["print"]
+        }
+      }
+    }
+  ]
+}
+
