@@ -19,11 +19,23 @@ export interface PrintResponse {
  * Printer configuration interface
  */
 export interface PrinterConfig {
-  interface: "usb" | "serial" | "mock";
+  interface: "usb" | "raw-usb" | "serial" | "mock" | "win-spool-raw";
+
   usbName?: string;
+  usbVid?: number;
+  usbPid?: number;
+
   serialPort?: string;
+
+  // NEW
+  windowsPrinterName?: string;
+  charset?: string;
+
   maxRetries: number;
   retryDelayMs: number;
+
+  // If you already have driver in config for USBAdapter, keep it:
+  driver?: any;
 }
 
 /**

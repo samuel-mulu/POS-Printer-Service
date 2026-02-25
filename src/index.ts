@@ -5,6 +5,7 @@ import fs from "fs";
 import http from "http";
 import https from "https";
 import morgan from "morgan";
+import path from "path";
 
 import { PrinterManager } from "./lib/printerManager";
 import { PrintQueue } from "./lib/printQueue";
@@ -21,7 +22,9 @@ const PORT = parseInt(process.env.PORT || "7777", 10);
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const isDevelopment =
-  NODE_ENV === "development" || process.env.DEV_MODE === "true" || !process.env.NODE_ENV;
+  NODE_ENV === "development" ||
+  process.env.DEV_MODE === "true" ||
+  !process.env.NODE_ENV;
 
 const PRINT_KEY =
   process.env.PRINT_KEY || (isDevelopment ? "dev-key-12345" : undefined);
@@ -45,46 +48,68 @@ const defaultDevOrigins = [
 
 // Validate required environment variables (only in production)
 if (!PRINT_KEY && !isDevelopment) {
-  console.error("ERROR: PRINT_KEY environment variable is required in production");
+  console.error(
+    "ERROR: PRINT_KEY environment variable is required in production"
+  );
   process.exit(1);
 }
 
 if (ENABLE_HTTPS && (!HTTPS_KEY_PATH || !HTTPS_CERT_PATH)) {
-  console.error("ERROR: ENABLE_HTTPS=true but HTTPS_KEY_PATH or HTTPS_CERT_PATH not set");
+  console.error(
+    "ERROR: ENABLE_HTTPS=true but HTTPS_KEY_PATH or HTTPS_CERT_PATH not set"
+  );
   process.exit(1);
 }
 
 // ---- Initialize printer manager ----
 let printerManager: PrinterManager;
 
-try {
-  let selectedInterface =
-    (process.env.PRINTER_INTERFACE as "usb" | "serial" | "mock") || "usb";
+  try {
+    let selectedInterface =
+      (process.env.PRINTER_INTERFACE as "usb" | "raw-usb" | "win-spool-raw" | "serial" | "mock") || "usb";
 
-  // In dev: fall back to mock if missing config
-  if (isDevelopment) {
-    if (selectedInterface === "usb" && !process.env.PRINTER_USB_NAME) {
-      console.warn(
-        "⚠️  PRINTER_INTERFACE=usb but PRINTER_USB_NAME is not set. Falling back to mock printer."
-      );
-      selectedInterface = "mock";
-    } else if (selectedInterface === "serial" && !process.env.PRINTER_SERIAL_PORT) {
-      console.warn(
-        "⚠️  PRINTER_INTERFACE=serial but PRINTER_SERIAL_PORT is not set. Falling back to mock printer."
-      );
-      selectedInterface = "mock";
-    } else if (!process.env.PRINTER_INTERFACE) {
-      selectedInterface = "mock";
+    // In dev: fall back to mock if missing config
+    if (isDevelopment) {
+      if (selectedInterface === "usb" && !process.env.PRINTER_USB_NAME) {
+        console.warn(
+          "⚠️  PRINTER_INTERFACE=usb but PRINTER_USB_NAME is not set. Falling back to mock printer."
+        );
+        selectedInterface = "mock";
+      } else if (selectedInterface === "raw-usb" && !process.env.PRINTER_USB_VID && !process.env.PRINTER_USB_PID) {
+        console.warn(
+          "⚠️  PRINTER_INTERFACE=raw-usb but PRINTER_USB_VID/PID are not set. Falling back to mock printer."
+        );
+        selectedInterface = "mock";
+      } else if (selectedInterface === "win-spool-raw" && !process.env.PRINTER_WINDOWS_NAME) {
+        console.warn(
+          "⚠️  PRINTER_INTERFACE=win-spool-raw but PRINTER_WINDOWS_NAME is not set. Falling back to mock printer."
+        );
+        selectedInterface = "mock";
+      } else if (
+        selectedInterface === "serial" &&
+        !process.env.PRINTER_SERIAL_PORT
+      ) {
+        console.warn(
+          "⚠️  PRINTER_INTERFACE=serial but PRINTER_SERIAL_PORT is not set. Falling back to mock printer."
+        );
+        selectedInterface = "mock";
+      } else if (!process.env.PRINTER_INTERFACE) {
+        selectedInterface = "mock";
+      }
     }
-  }
 
-  const printerConfig: PrinterConfig = {
-    interface: selectedInterface,
-    usbName: process.env.PRINTER_USB_NAME,
-    serialPort: process.env.PRINTER_SERIAL_PORT,
-    maxRetries: parseInt(process.env.MAX_RETRIES || "3", 10),
-    retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || "1000", 10),
-  };
+    const printerConfig: PrinterConfig = {
+      interface: selectedInterface as any,
+      usbName: process.env.PRINTER_USB_NAME,
+      usbVid: process.env.PRINTER_USB_VID ? parseInt(process.env.PRINTER_USB_VID, 16) : undefined,
+      usbPid: process.env.PRINTER_USB_PID ? parseInt(process.env.PRINTER_USB_PID, 16) : undefined,
+      windowsPrinterName: process.env.PRINTER_WINDOWS_NAME,
+      charset: process.env.PRINTER_CHARSET || "cp437",
+      serialPort: process.env.PRINTER_SERIAL_PORT,
+      driver: process.env.PRINTER_DRIVER,
+      maxRetries: parseInt(process.env.MAX_RETRIES || "3", 10),
+      retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || "1000", 10),
+    };
 
   printerManager = new PrinterManager(printerConfig);
 
@@ -94,7 +119,9 @@ try {
     console.log(`   Default PRINT_KEY: ${PRINT_KEY}`);
   }
 
-  console.log(`Printer Manager initialized with interface: ${printerConfig.interface}`);
+  console.log(
+    `Printer Manager initialized with interface: ${printerConfig.interface}`
+  );
 } catch (error) {
   console.error("ERROR: Failed to initialize printer manager:", error);
   process.exit(1);
@@ -150,7 +177,11 @@ function validatePrintKey(req: Request): boolean {
 
   if (headerKey && headerKey === PRINT_KEY) return true;
 
-  if (req.body && typeof req.body === "object" && (req.body as any).key === PRINT_KEY) {
+  if (
+    req.body &&
+    typeof req.body === "object" &&
+    (req.body as any).key === PRINT_KEY
+  ) {
     return true;
   }
 
@@ -158,7 +189,9 @@ function validatePrintKey(req: Request): boolean {
     console.log("🔍 [DEBUG] Print key validation failed:");
     console.log(`   Expected key: ${PRINT_KEY}`);
     console.log(`   Header key received: ${headerKey || "(not provided)"}`);
-    console.log(`   Body key received: ${(req.body as any)?.key || "(not provided)"}`);
+    console.log(
+      `   Body key received: ${(req.body as any)?.key || "(not provided)"}`
+    );
   }
 
   return false;
@@ -169,7 +202,8 @@ function extractPrintData(
 ): { ok: true; data: string } | { ok: false; error: string } {
   if (typeof req.body === "string") {
     const t = req.body;
-    if (!t || t.trim().length === 0) return { ok: false, error: "Print data cannot be empty" };
+    if (!t || t.trim().length === 0)
+      return { ok: false, error: "Print data cannot be empty" };
     return { ok: true, data: t };
   }
 
@@ -185,6 +219,41 @@ function extractPrintData(
 }
 
 // ---- Routes ----
+
+// Serve companion UI
+app.use("/ui", express.static(path.join(__dirname, "../public/ui")));
+
+// Redirect root to UI
+app.get("/", (req, res) => {
+  res.redirect("/ui");
+});
+
+/**
+ * ✅ KISS: Minimal config endpoints expected by your frontend dashboard
+ * They reflect .env values and avoid 404s.
+ */
+app.get("/config", (req: Request, res: Response) => {
+  res.json({
+    success: true,
+    config: {
+      interface:
+        (process.env.PRINTER_INTERFACE as "usb" | "serial" | "mock") || "usb",
+      usbName: process.env.PRINTER_USB_NAME || null,
+      serialPort: process.env.PRINTER_SERIAL_PORT || null,
+      maxRetries: parseInt(process.env.MAX_RETRIES || "3", 10),
+      retryDelayMs: parseInt(process.env.RETRY_DELAY_MS || "1000", 10),
+    },
+  });
+});
+
+app.get("/config/available", (req: Request, res: Response) => {
+  // KISS: return empty lists (UI won't break). You can enhance later.
+  res.json({
+    usbPrinters: [],
+    serialPorts: [],
+  });
+});
+
 app.post("/print", async (req: Request, res: Response) => {
   try {
     if (!validatePrintKey(req)) {
@@ -303,6 +372,7 @@ async function startServer() {
       console.log("=".repeat(60));
       console.log(`📝 Print endpoint: ${protocol}://127.0.0.1:${PORT}/print`);
       console.log(`❤️  Health check: ${protocol}://127.0.0.1:${PORT}/health`);
+      console.log(`🧩 Local UI: ${protocol}://127.0.0.1:${PORT}/ui`);
 
       if (isDevelopment) {
         console.log(`\n🔑 Current PRINT_KEY: ${PRINT_KEY}`);
