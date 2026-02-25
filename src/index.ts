@@ -1,58 +1,79 @@
-import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
-import morgan from "morgan";
 import dotenv from "dotenv";
+import express, { NextFunction, Request, Response } from "express";
+import fs from "fs";
+import http from "http";
+import https from "https";
+import morgan from "morgan";
+
 import { PrinterManager } from "./lib/printerManager";
 import { PrintQueue } from "./lib/printQueue";
-import { PrintRequest, PrintResponse, PrinterConfig } from "./types";
+import { PrintResponse, PrinterConfig } from "./types";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
+app.disable("x-powered-by");
+
+// ---- Config ----
 const PORT = parseInt(process.env.PORT || "7777", 10);
 
-// Check if we're in development mode
+const NODE_ENV = process.env.NODE_ENV || "development";
 const isDevelopment =
-  process.env.NODE_ENV === "development" ||
-  process.env.DEV_MODE === "true" ||
-  !process.env.NODE_ENV;
+  NODE_ENV === "development" || process.env.DEV_MODE === "true" || !process.env.NODE_ENV;
 
-// Use default print key in development mode
 const PRINT_KEY =
   process.env.PRINT_KEY || (isDevelopment ? "dev-key-12345" : undefined);
 
+const ENABLE_HTTPS = process.env.ENABLE_HTTPS === "true";
+const HTTPS_KEY_PATH = process.env.HTTPS_KEY_PATH;
+const HTTPS_CERT_PATH = process.env.HTTPS_CERT_PATH;
+
+// Comma-separated origins, e.g.
+// ALLOWED_ORIGINS=https://frontend-restaurant-web-app.vercel.app,http://localhost:3000
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const defaultDevOrigins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "https://frontend-restaurant-web-app.vercel.app",
+];
+
 // Validate required environment variables (only in production)
 if (!PRINT_KEY && !isDevelopment) {
-  console.error("ERROR: PRINT_KEY environment variable is required");
+  console.error("ERROR: PRINT_KEY environment variable is required in production");
   process.exit(1);
 }
 
-// Initialize printer manager
+if (ENABLE_HTTPS && (!HTTPS_KEY_PATH || !HTTPS_CERT_PATH)) {
+  console.error("ERROR: ENABLE_HTTPS=true but HTTPS_KEY_PATH or HTTPS_CERT_PATH not set");
+  process.exit(1);
+}
+
+// ---- Initialize printer manager ----
 let printerManager: PrinterManager;
 
 try {
-  // Determine the interface to use
   let selectedInterface =
     (process.env.PRINTER_INTERFACE as "usb" | "serial" | "mock") || "usb";
 
-  // In development mode, check if required config is missing and fall back to mock
+  // In dev: fall back to mock if missing config
   if (isDevelopment) {
     if (selectedInterface === "usb" && !process.env.PRINTER_USB_NAME) {
       console.warn(
         "⚠️  PRINTER_INTERFACE=usb but PRINTER_USB_NAME is not set. Falling back to mock printer."
       );
       selectedInterface = "mock";
-    } else if (
-      selectedInterface === "serial" &&
-      !process.env.PRINTER_SERIAL_PORT
-    ) {
+    } else if (selectedInterface === "serial" && !process.env.PRINTER_SERIAL_PORT) {
       console.warn(
         "⚠️  PRINTER_INTERFACE=serial but PRINTER_SERIAL_PORT is not set. Falling back to mock printer."
       );
       selectedInterface = "mock";
     } else if (!process.env.PRINTER_INTERFACE) {
-      // No interface specified, default to mock in dev
       selectedInterface = "mock";
     }
   }
@@ -71,66 +92,101 @@ try {
     console.log("🔧 DEVELOPMENT MODE: Using mock printer adapter");
     console.log("   Print jobs will be logged to console instead of printing");
     console.log(`   Default PRINT_KEY: ${PRINT_KEY}`);
-    console.log(
-      "   To use a real printer, set PRINTER_INTERFACE=usb or PRINTER_INTERFACE=serial"
-    );
   }
 
-  console.log(
-    `Printer Manager initialized with interface: ${printerConfig.interface}`
-  );
+  console.log(`Printer Manager initialized with interface: ${printerConfig.interface}`);
 } catch (error) {
   console.error("ERROR: Failed to initialize printer manager:", error);
   process.exit(1);
 }
 
-// Initialize print queue to handle concurrent requests
-const printQueue = new PrintQueue((data: string) => {
-  return printerManager.print(data);
-});
+// ---- Print queue ----
+const printQueue = new PrintQueue((data: string) => printerManager.print(data));
 console.log("📋 Print queue initialized - Jobs will be processed sequentially");
 
-// Middleware
-app.use(cors());
-app.use(morgan("combined"));
-app.use(express.json());
-app.use(express.text({ type: "text/plain" }));
+// ---- Middleware ----
 
-/**
- * Validate print key from request
- */
+// Basic security headers (simple)
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
+
+// CORS allowlist
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // allow tools (curl/postman) with no Origin
+      if (!origin) return cb(null, true);
+
+      const allowed = new Set([...defaultDevOrigins, ...ALLOWED_ORIGINS]);
+
+      if (allowed.has(origin)) return cb(null, true);
+
+      // in dev allow everything (optional)
+      if (isDevelopment) return cb(null, true);
+
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "X-Print-Key"],
+  })
+);
+
+// ✅ FIX: preflight for all routes (avoid "*" crash)
+app.options(/.*/, cors());
+
+app.use(morgan(isDevelopment ? "dev" : "combined"));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.text({ type: "text/plain", limit: "1mb" }));
+
+// ---- Helpers ----
 function validatePrintKey(req: Request): boolean {
-  // Check header first (case-insensitive)
   const headerKey =
     (req.headers["x-print-key"] as string) ||
     (req.headers["X-Print-Key"] as string);
 
-  if (headerKey && headerKey === PRINT_KEY) {
+  if (headerKey && headerKey === PRINT_KEY) return true;
+
+  if (req.body && typeof req.body === "object" && (req.body as any).key === PRINT_KEY) {
     return true;
   }
 
-  // Check body if it's a PrintRequest
-  if (req.body && typeof req.body === "object" && req.body.key === PRINT_KEY) {
-    return true;
-  }
-
-  // Debug logging in development mode
   if (isDevelopment) {
     console.log("🔍 [DEBUG] Print key validation failed:");
     console.log(`   Expected key: ${PRINT_KEY}`);
     console.log(`   Header key received: ${headerKey || "(not provided)"}`);
-    console.log(`   Body key received: ${req.body?.key || "(not provided)"}`);
+    console.log(`   Body key received: ${(req.body as any)?.key || "(not provided)"}`);
   }
 
   return false;
 }
 
-/**
- * POST /print - Print receipt
- */
+function extractPrintData(
+  req: Request
+): { ok: true; data: string } | { ok: false; error: string } {
+  if (typeof req.body === "string") {
+    const t = req.body;
+    if (!t || t.trim().length === 0) return { ok: false, error: "Print data cannot be empty" };
+    return { ok: true, data: t };
+  }
+
+  if (req.body && typeof req.body === "object") {
+    const d = (req.body as any).data;
+    if (typeof d !== "string" || d.trim().length === 0) {
+      return { ok: false, error: 'Print data is required in "data" field' };
+    }
+    return { ok: true, data: d };
+  }
+
+  return { ok: false, error: "Print data is required" };
+}
+
+// ---- Routes ----
 app.post("/print", async (req: Request, res: Response) => {
   try {
-    // Validate authentication
     if (!validatePrintKey(req)) {
       const response: PrintResponse = {
         success: false,
@@ -140,55 +196,26 @@ app.post("/print", async (req: Request, res: Response) => {
       return res.status(401).json(response);
     }
 
-    // Extract print data
-    let printData: string;
-
-    if (typeof req.body === "string") {
-      // Plain text body
-      printData = req.body;
-    } else if (req.body && typeof req.body === "object") {
-      // JSON body with data field
-      if (req.body.data && typeof req.body.data === "string") {
-        printData = req.body.data;
-      } else {
-        const response: PrintResponse = {
-          success: false,
-          message: "Invalid request",
-          error: 'Print data is required in "data" field',
-        };
-        return res.status(400).json(response);
-      }
-    } else {
+    const extracted = extractPrintData(req);
+    if (!extracted.ok) {
       const response: PrintResponse = {
         success: false,
         message: "Invalid request",
-        error: "Print data is required",
+        error: extracted.error,
       };
       return res.status(400).json(response);
     }
 
-    if (!printData || printData.trim().length === 0) {
-      const response: PrintResponse = {
-        success: false,
-        message: "Invalid request",
-        error: "Print data cannot be empty",
-      };
-      return res.status(400).json(response);
-    }
-
-    // Get queue position before adding
     const queuePosition = printQueue.getQueueLength();
     const isProcessing = printQueue.isProcessing();
 
-    // Add print job to queue (will be processed sequentially)
     console.log(
       `📥 [QUEUE] New print job received (Queue position: ${
         queuePosition + 1
       }, Processing: ${isProcessing})`
     );
 
-    // Execute print job through queue
-    await printQueue.enqueue(printData);
+    await printQueue.enqueue(extracted.data);
 
     const response: PrintResponse = {
       success: true,
@@ -207,9 +234,6 @@ app.post("/print", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * GET /health - Health check endpoint
- */
 app.get("/health", (req: Request, res: Response) => {
   const isConnected = printerManager.isConnected();
   const queueLength = printQueue.getQueueLength();
@@ -217,6 +241,8 @@ app.get("/health", (req: Request, res: Response) => {
 
   res.json({
     status: "ok",
+    env: NODE_ENV,
+    https: ENABLE_HTTPS,
     printerConnected: isConnected,
     queue: {
       length: queueLength,
@@ -226,22 +252,17 @@ app.get("/health", (req: Request, res: Response) => {
   });
 });
 
-/**
- * Error handling middleware
- */
+// ---- Error handling ----
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   console.error("Unhandled error:", err);
   const response: PrintResponse = {
     success: false,
     message: "Internal server error",
-    error: err.message,
+    error: isDevelopment ? err.message : "Internal server error",
   };
   res.status(500).json(response);
 });
 
-/**
- * 404 handler
- */
 app.use((req: Request, res: Response) => {
   res.status(404).json({
     success: false,
@@ -250,12 +271,10 @@ app.use((req: Request, res: Response) => {
   });
 });
 
-/**
- * Start server
- */
+// ---- Start server ----
 async function startServer() {
   try {
-    // Try to connect to printer on startup
+    // Connect printer on startup
     try {
       await printerManager.connect();
       console.log("Printer connected successfully");
@@ -266,21 +285,31 @@ async function startServer() {
       );
     }
 
-    app.listen(PORT, () => {
+    const protocol = ENABLE_HTTPS ? "https" : "http";
+
+    let server: http.Server | https.Server;
+
+    if (ENABLE_HTTPS) {
+      const key = fs.readFileSync(HTTPS_KEY_PATH!, "utf8");
+      const cert = fs.readFileSync(HTTPS_CERT_PATH!, "utf8");
+      server = https.createServer({ key, cert }, app);
+    } else {
+      server = http.createServer(app);
+    }
+
+    server.listen(PORT, () => {
       console.log("\n" + "=".repeat(60));
       console.log(`✅ POS Printer Service running on port ${PORT}`);
       console.log("=".repeat(60));
-      console.log(`📝 Print endpoint: http://localhost:${PORT}/print`);
-      console.log(`❤️  Health check: http://localhost:${PORT}/health`);
-      console.log(`\n🔑 Current PRINT_KEY: ${PRINT_KEY}`);
+      console.log(`📝 Print endpoint: ${protocol}://127.0.0.1:${PORT}/print`);
+      console.log(`❤️  Health check: ${protocol}://127.0.0.1:${PORT}/health`);
+
       if (isDevelopment) {
-        console.log(`   ⚠️  Development mode active`);
-        console.log("   Example request:");
-        console.log(`   curl -X POST http://localhost:${PORT}/print \\`);
-        console.log(`     -H "Content-Type: application/json" \\`);
-        console.log(`     -H "X-Print-Key: ${PRINT_KEY}" \\`);
-        console.log(`     -d '{"data": "Test Receipt\\nLine 1\\nLine 2"}'`);
+        console.log(`\n🔑 Current PRINT_KEY: ${PRINT_KEY}`);
+      } else {
+        console.log("\n🔑 PRINT_KEY: (hidden in production logs)");
       }
+
       console.log("=".repeat(60) + "\n");
     });
   } catch (error) {
@@ -289,9 +318,9 @@ async function startServer() {
   }
 }
 
-// Handle graceful shutdown
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM received, shutting down gracefully...");
+// Graceful shutdown
+async function shutdown(signal: string) {
+  console.log(`${signal} received, shutting down gracefully...`);
   try {
     await printerManager.disconnect();
     process.exit(0);
@@ -299,18 +328,9 @@ process.on("SIGTERM", async () => {
     console.error("Error during shutdown:", error);
     process.exit(1);
   }
-});
+}
 
-process.on("SIGINT", async () => {
-  console.log("SIGINT received, shutting down gracefully...");
-  try {
-    await printerManager.disconnect();
-    process.exit(0);
-  } catch (error) {
-    console.error("Error during shutdown:", error);
-    process.exit(1);
-  }
-});
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
-// Start the server
 startServer();
